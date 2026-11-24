@@ -115,15 +115,17 @@ void DeReverbenjaminV3Processor::processFrame(ChannelState& state, float amount,
 
     const float binHz = static_cast<float>(currentSampleRate) / static_cast<float>(fftSize);
 
-    // Piso más profundo que en v2 para lograr mayor secado cuando se empuja De-Room
-    float modeFloor = 0.02f;               // DRUMS: secado agresivo permitido
-    if (mode == 1) modeFloor = 0.045f;     // VOCAL: limpio pero sin huecos robóticos
-    else if (mode == 2) modeFloor = 0.03f; // GTR/BASS
-    else if (mode == 3) modeFloor = 0.05f; // KEYS
+    // Piso y agresividad específicos por instrumento
+    float modeFloor = 0.02f;               // DRUMS: secado profundo intacto
+    if (mode == 1) modeFloor = 0.11f;      // VOCAL: evita que palabras suaves desaparezcan
+    else if (mode == 2) modeFloor = 0.04f; // GTR/BASS
+    else if (mode == 3) modeFloor = 0.06f; // KEYS
 
-    // Rango de sobresustracción ampliado para atrapar mejor la sala
-    const float overSub = 0.65f + roomFocus * 2.85f;
-    const float minGain = std::max(modeFloor, 1.0f - (amount * 0.98f));
+    const float overSub = (mode == 1)
+        ? (0.50f + roomFocus * 2.05f)      // VOCAL: más preciso, menos agresivo con sílabas
+        : (0.65f + roomFocus * 2.85f);     // DRUMS/otros: igual que v3
+
+    const float minGain = std::max(modeFloor, 1.0f - (amount * (mode == 1 ? 0.89f : 0.98f)));
     const float timeSmooth = 0.24f + smoothness * 0.66f;
 
     for (int k = 0; k < numBins; ++k)
@@ -133,16 +135,29 @@ void DeReverbenjaminV3Processor::processFrame(ChannelState& state, float amount,
         const float im = state.fftData[2 * k + 1];
         const float power = re * re + im * im;
 
-        // Protección espectral suave según instrumento
-        float bandWeight = 1.0f;
-        if (mode == 0 && freq < 95.0f)                           bandWeight = 0.55f; // DRUMS: cuida sub-bombo
-        else if (mode == 1 && freq >= 150.0f && freq <= 3200.0f) bandWeight = 0.85f; // VOCAL: cuida formantes
-        else if (mode == 2 && freq >= 90.0f && freq <= 2000.0f)  bandWeight = 0.80f; // GTR/BASS
-        else if (mode == 3 && freq < 220.0f)                     bandWeight = 0.72f; // KEYS
+        // En VOCAL: si entra una sílaba o consonante nueva, soltamos rápido el estimado de sala anterior
+        const bool vocalOnset = (mode == 1) && (power > state.prevPower[k] * 1.55f);
+        const float effectiveDecay = vocalOnset ? (roomDecay * 0.52f) : roomDecay;
 
-        state.reverbEst[k] = std::max(roomDecay * state.reverbEst[k],
+        state.reverbEst[k] = std::max(effectiveDecay * state.reverbEst[k],
                                       0.32f * state.reverbEst[k] + 0.68f * state.prevPower[k]);
         state.prevPower[k] = power;
+
+        // Protección espectral específica por instrumento
+        float bandWeight = 1.0f;
+        if (mode == 0 && freq < 95.0f)
+            bandWeight = 0.55f; // DRUMS: cuida sub-bombo
+        else if (mode == 1)
+        {
+            if (vocalOnset && freq >= 2200.0f && freq <= 7000.0f)
+                bandWeight = 0.42f; // VOCAL: protege consonantes (p, t, k, s) en el ataque
+            else if (freq >= 170.0f && freq <= 3400.0f)
+                bandWeight = 0.72f; // VOCAL: protege cuerpo e inteligibilidad de la voz
+        }
+        else if (mode == 2 && freq >= 90.0f && freq <= 2000.0f)
+            bandWeight = 0.80f; // GTR/BASS
+        else if (mode == 3 && freq < 220.0f)
+            bandWeight = 0.72f; // KEYS
 
         const float estRoom = state.reverbEst[k] * overSub * bandWeight;
         const float cleanPower = std::max(0.0f, power - estRoom);
@@ -163,7 +178,9 @@ void DeReverbenjaminV3Processor::processFrame(ChannelState& state, float amount,
               + 0.20f * state.rawGain[k + 1] + 0.10f * state.rawGain[k + 2];
         }
 
-        state.smoothGain[k] = timeSmooth * state.smoothGain[k] + (1.0f - timeSmooth) * g;
+        // En VOCAL: ataque de apertura más rápido para no comerse el inicio de palabras
+        const float coeff = (mode == 1 && g > state.smoothGain[k]) ? (timeSmooth * 0.45f) : timeSmooth;
+        state.smoothGain[k] = coeff * state.smoothGain[k] + (1.0f - coeff) * g;
         gainSum += state.smoothGain[k];
 
         state.fftData[2 * k]     *= state.smoothGain[k];
@@ -209,15 +226,17 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
     const float sr = static_cast<float>(currentSampleRate);
     constexpr float twoPi = juce::MathConstants<float>::twoPi;
 
-    // Constantes Etapa 2 (De-Tail)
-    const float fastAttack = std::exp(-1.0f / (sr * (mode == 0 ? 0.002f : 0.004f)));
-    const float fastRelease = std::exp(-1.0f / (sr * 0.038f));
-    const float slowAttack = std::exp(-1.0f / (sr * 0.045f));
-    const float slowRelease = std::exp(-1.0f / (sr * (releaseMs * 0.001f)));
-    const float gainSmoothCoeff = std::exp(-1.0f / (sr * 0.012f));
+    // Constantes Etapa 2 (De-Tail) adaptadas por instrumento
+    const float fastAttack = std::exp(-1.0f / (sr * (mode == 0 ? 0.002f : 0.003f)));
+    const float fastRelease = std::exp(-1.0f / (sr * (mode == 1 ? 0.055f : 0.038f)));
+    const float slowAttack = std::exp(-1.0f / (sr * (mode == 1 ? 0.035f : 0.045f)));
+    const float effectiveRelMs = (mode == 1) ? std::min(releaseMs, 180.0f) : releaseMs;
+    const float slowRelease = std::exp(-1.0f / (sr * (effectiveRelMs * 0.001f)));
+    const float gainSmoothAtk = std::exp(-1.0f / (sr * (mode == 1 ? 0.004f : 0.012f)));
+    const float gainSmoothRel = std::exp(-1.0f / (sr * 0.014f));
 
-    // Constantes Etapa 3: Detector de transientes SUAVIZADO (evita distorsión)
-    const float transFastAtk = std::exp(-1.0f / (sr * 0.0020f)); // 2 ms ataque: filtra ciclos individuales
+    // Constantes Etapa 3: Detector de transientes suavizado
+    const float transFastAtk = std::exp(-1.0f / (sr * 0.0020f));
     const float transFastRel = std::exp(-1.0f / (sr * (mode == 0 ? 0.018f : 0.028f)));
     const float transSlowAtk = std::exp(-1.0f / (sr * 0.018f));
     const float transSlowRel = std::exp(-1.0f / (sr * (mode == 0 ? 0.085f : 0.130f)));
@@ -293,7 +312,7 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
         if (numChannels > 0)
             spectralGainAvg = frameGainSum / static_cast<float>(numChannels);
 
-        // --- ETAPA 2: Dual-Envelope Tail De-Reverb ---
+        // --- ETAPA 2: Dual-Envelope Tail De-Reverb (Específico por instrumento) ---
         fastEnv = (wetPeak > fastEnv)
             ? fastAttack * fastEnv + (1.0f - fastAttack) * wetPeak
             : fastRelease * fastEnv + (1.0f - fastRelease) * wetPeak;
@@ -307,11 +326,22 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
         if (ratio < sensitivity)
         {
             float reduction = juce::jlimit(0.0f, 1.0f, ratio / sensitivity);
-            targetGain = (1.0f - tailAmount) + (tailAmount * reduction * reduction * reduction);
+            if (mode == 1)
+            {
+                // VOCAL: curva suave + piso de seguridad para no hundir palabras suaves
+                const float vocalCurve = reduction * std::sqrt(reduction);
+                targetGain = std::max(0.24f, (1.0f - tailAmount) + (tailAmount * vocalCurve));
+            }
+            else
+            {
+                // DRUMS y otros: curva cúbica intacta de v3
+                targetGain = (1.0f - tailAmount) + (tailAmount * reduction * reduction * reduction);
+            }
         }
-        tailSmoothGain = gainSmoothCoeff * tailSmoothGain + (1.0f - gainSmoothCoeff) * targetGain;
+        const float gsCoeff = (targetGain > tailSmoothGain) ? gainSmoothAtk : gainSmoothRel;
+        tailSmoothGain = gsCoeff * tailSmoothGain + (1.0f - gsCoeff) * targetGain;
 
-        // --- ETAPA 3: Envolventes de Resíntesis (Sin Distorsión) ---
+        // --- ETAPA 3: Envolventes de Resíntesis ---
         dryTransFast = (dryPeak > dryTransFast)
             ? transFastAtk * dryTransFast + (1.0f - transFastAtk) * dryPeak
             : transFastRel * dryTransFast + (1.0f - transFastRel) * dryPeak;
@@ -375,14 +405,11 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
 
             if (mode == 0) // === DRUMS: PUNCH / THUMP / SNAP ===
             {
-                // 1. PUNCH: rescate de transiente suave y limpio
                 sig += (dry - sig) * (transSmooth * res1 * 0.78f);
 
-                // 2. THUMP: síntesis de sub-grave limpia (62 Hz) + peso en graves
                 if (res2 > 0.001f)
                     sig += (subSample * 0.42f + std::tanh(lowBand * 1.8f) * 0.25f) * res2;
 
-                // 3. SNAP: bordona/ataque resintetizado con ruido modulado + brillo seco
                 if (res3 > 0.001f)
                 {
                     const float snapNoise = shapedAirNoise * transSmooth * cleanGate * 0.14f;
@@ -390,8 +417,12 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
                     sig += (snapNoise + snapHigh) * res3 * (0.7f + spectralLoss * 0.5f);
                 }
             }
-            else if (mode == 1) // === VOCAL: BODY / PRESENCE / SILK ===
+            else if (mode == 1) // === VOCAL: BODY / PRESENCE / SILK + AUTO-LEVELER ===
             {
+                // Compensación automática de volumen cuando hay mucha supresión (solo mientras se canta)
+                const float vocalMakeup = 1.0f + (spectralLoss * 0.34f * cleanGate);
+                sig *= vocalMakeup;
+
                 // 1. BODY: efecto de proximidad + armónicos pares suaves estilo tubo
                 if (res1 > 0.001f)
                 {
@@ -399,13 +430,13 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
                     sig += std::tanh(evenHarm * 1.6f) * res1 * 0.48f;
                 }
 
-                // 2. PRESENCE: consonantes claras + Opto-Glue sutil de estudio
+                // 2. PRESENCE: rescate de consonantes + Opto-Glue de estudio
                 if (res2 > 0.001f)
                 {
-                    sig += (dry - sig) * (transSmooth * res2 * 0.40f);
+                    sig += (dry - sig) * (transSmooth * res2 * 0.46f);
                     sig += std::tanh(midBand * 1.7f) * res2 * 0.35f;
-                    const float glue = 1.0f / (1.0f + vocalOptoEnv * res2 * 1.6f);
-                    sig *= (glue * (1.0f + res2 * 0.28f));
+                    const float glue = 1.0f / (1.0f + vocalOptoEnv * res2 * 1.5f);
+                    sig *= (glue * (1.0f + res2 * 0.30f));
                 }
 
                 // 3. SILK: aire de micrófono de condensador resintetizado (con gate en pausas)
@@ -418,10 +449,8 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
             }
             else if (mode == 2) // === GTR/BASS: ATTACK / WARMTH / BITE ===
             {
-                // 1. ATTACK: definición limpia de uñeta/dedos
                 sig += (dry - sig) * (transSmooth * res1 * 0.72f);
 
-                // 2. WARMTH: saturación analógica de cinta proporcional a la pérdida espectral
                 if (res2 > 0.001f)
                 {
                     const float drive = 1.0f + res2 * (1.6f + spectralLoss * 2.0f);
@@ -429,23 +458,19 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
                     sig = sig * (1.0f - res2 * 0.65f) + sat * (res2 * 0.65f);
                 }
 
-                // 3. BITE: mordida armónica en medios-agudos
                 if (res3 > 0.001f)
                     sig += std::tanh(midBand * 2.4f) * res3 * 0.45f;
             }
             else // === KEYS: HAMMER / RICHNESS / SHIMMER ===
             {
-                // 1. HAMMER: definición limpia del golpe inicial de tecla/martillo
                 sig += (dry - sig) * (transSmooth * res1 * 0.68f);
 
-                // 2. RICHNESS: armónicos pares suaves para densidad de acordes
                 if (res2 > 0.001f)
                 {
                     const float rich = sig + 0.22f * sig * sig;
                     sig = sig * (1.0f - res2 * 0.45f) + std::tanh(rich * 1.4f) * (res2 * 0.45f);
                 }
 
-                // 3. SHIMMER: brillo aéreo abierto + toque sutil de aire limpio
                 if (res3 > 0.001f)
                 {
                     const float keyAir = shapedAirNoise * airGateEnv * cleanGate * 0.08f;
@@ -453,7 +478,7 @@ void DeReverbenjaminV3Processor::processBlock(juce::AudioBuffer<float>& buffer, 
                 }
             }
 
-            // Bloqueador de DC (elimina cualquier desplazamiento de los armónicos pares)
+            // Bloqueador de DC
             const float dcBlocked = sig - state.dcPrevIn + 0.995f * state.dcPrevOut;
             state.dcPrevIn = sig;
             state.dcPrevOut = dcBlocked;
