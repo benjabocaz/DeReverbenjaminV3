@@ -1,0 +1,26 @@
+name: Build DeReverbenjamin v3 AU
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Audio Unit (.component)
+        run: cmake --build build --config Release --target DeReverbenjaminV3_AU -j 4
+
+      - name: Upload .component Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeReverbenjamin-v3-AU-macOS
+          path: build/DeReverbenjaminV3_artefacts/Release/AU/
